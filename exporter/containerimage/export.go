@@ -226,6 +226,11 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 	}
 	maps.Copy(src.Metadata, e.meta)
 
+	// Check if frontend produced a pre-built OCI layout
+	if _, ok := src.Metadata[exptypes.ExporterOCILayoutKey]; ok {
+		return e.exportOCILayout(ctx, src, buildInfo)
+	}
+
 	opts := e.opts
 	as, _, err := ParseAnnotations(src.Metadata)
 	if err != nil {
@@ -405,6 +410,117 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 	}
 
 	return resp, finalize, descref, nil
+}
+
+func (e *imageExporterInstance) exportOCILayout(ctx context.Context, src *exporter.Source, buildInfo exporter.ExportBuildInfo) (_ map[string]string, _ exporter.FinalizeFunc, descref exporter.DescriptorReference, err error) {
+	if e.unpack {
+		return nil, nil, nil, errors.Errorf("unpack is not supported for OCI layout export")
+	}
+	if e.opts.RewriteTimestamp {
+		return nil, nil, nil, errors.Errorf("rewrite-timestamp is not supported for OCI layout export")
+	}
+	if len(src.Attestations) > 0 {
+		return nil, nil, nil, errors.Errorf("attestations are not supported for OCI layout export; attestations must be included in the OCI layout by the frontend")
+	}
+	if src.Ref == nil {
+		return nil, nil, nil, errors.Errorf("OCI layout export requires a non-nil ref")
+	}
+
+	ctx, done, err := leaseutil.WithLease(ctx, e.opt.LeaseManager, leaseutil.MakeTemporary)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer func() {
+		if descref == nil {
+			done(context.WithoutCancel(ctx))
+		}
+	}()
+
+	desc, err := e.opt.ImageWriter.CommitOCILayout(ctx, src.Ref, buildInfo.SessionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	resp := make(map[string]string)
+	resp[exptypes.ExporterImageDigestKey] = desc.Digest.String()
+
+	dtdesc, err := json.Marshal(desc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	resp[exptypes.ExporterImageDescriptorKey] = base64.StdEncoding.EncodeToString(dtdesc)
+
+	if n, ok := src.Metadata["image.name"]; e.opts.ImageName == "*" && ok {
+		e.opts.ImageName = string(n)
+	}
+
+	var namesToPush []string
+
+	if e.opts.ImageName != "" {
+		targetNames := strings.SplitSeq(e.opts.ImageName, ",")
+		for targetName := range targetNames {
+			if e.opt.Images != nil && e.store {
+				tagDone := progress.OneOff(ctx, "naming to "+targetName)
+				img := images.Image{
+					Target: *desc,
+				}
+
+				sfx := []string{""}
+				if e.nameCanonical && !strings.ContainsRune(targetName, '@') {
+					sfx = append(sfx, "@"+desc.Digest.String())
+				}
+				for _, sfx := range sfx {
+					img.Name = targetName + sfx
+					for {
+						if _, err := e.opt.Images.Update(ctx, img); err != nil {
+							if !errors.Is(err, cerrdefs.ErrNotFound) {
+								return nil, nil, nil, tagDone(err)
+							}
+							if _, err := e.opt.Images.Create(ctx, img); err != nil {
+								if !errors.Is(err, cerrdefs.ErrAlreadyExists) {
+									return nil, nil, nil, tagDone(err)
+								}
+								continue
+							}
+						}
+						break
+					}
+				}
+				tagDone(nil)
+			}
+
+			if e.push {
+				namesToPush = append(namesToPush, targetName)
+			}
+		}
+		resp[exptypes.ExporterImageNameKey] = e.opts.ImageName
+	}
+
+	descref = NewDescriptorReference(*desc, done)
+
+	if len(namesToPush) == 0 {
+		return resp, nil, descref, nil
+	}
+
+	finalize := func(ctx context.Context) error {
+		for _, targetName := range namesToPush {
+			if err := e.pushOCILayout(ctx, buildInfo.SessionID, targetName, desc.Digest); err != nil {
+				var statusErr remoteserrors.ErrUnexpectedStatus
+				if errors.As(err, &statusErr) {
+					err = errutil.WithDetails(err)
+				}
+				return errors.Wrapf(err, "failed to push %v", targetName)
+			}
+		}
+		return nil
+	}
+
+	return resp, finalize, descref, nil
+}
+
+func (e *imageExporterInstance) pushOCILayout(ctx context.Context, sessionID string, targetName string, dgst digest.Digest) error {
+	cs := e.opt.ImageWriter.ContentStore()
+	return push.Push(ctx, e.opt.SessionManager, sessionID, cs, cs, dgst, targetName, e.insecure, e.opt.RegistryHosts, e.pushByDigest, nil)
 }
 
 func (e *imageExporterInstance) pushImage(ctx context.Context, src *exporter.Source, sessionID string, targetName string, dgst digest.Digest) error {

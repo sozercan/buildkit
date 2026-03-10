@@ -16,6 +16,7 @@ const (
 	ExporterImageDescriptorKey   = "containerimage.descriptor"
 	ExporterImageBaseConfigKey   = "containerimage.base.config"
 	ExporterPlatformsKey         = "refs.platforms"
+	ExporterOCILayoutKey         = "containerimage.oci-layout"
 )
 
 // KnownRefMetadataKeys are the subset of exporter keys that can be suffixed by

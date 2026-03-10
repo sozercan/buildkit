@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/platforms"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
@@ -347,6 +350,111 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 	idxDone(nil)
 
 	return &idxDesc, nil
+}
+
+func (ic *ImageWriter) CommitOCILayout(ctx context.Context, ref cache.ImmutableRef, sessionID string) (*ocispecs.Descriptor, error) {
+	if ref == nil {
+		return nil, errors.Errorf("OCI layout export requires a non-nil ref")
+	}
+
+	mount, err := ref.Mount(ctx, true, session.NewGroup(sessionID))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to mount ref for OCI layout")
+	}
+	lm := snapshot.LocalMounter(mount)
+	root, err := lm.Mount()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to mount snapshot for OCI layout")
+	}
+	defer lm.Unmount()
+
+	// Auto-detect OCI layout directory: check root first, then immediate subdirectories
+	layoutDir := root
+	if _, err := os.Stat(filepath.Join(root, "oci-layout")); os.IsNotExist(err) {
+		entries, dirErr := os.ReadDir(root)
+		if dirErr != nil {
+			return nil, errors.Wrap(dirErr, "failed to read mount root")
+		}
+		found := false
+		for _, e := range entries {
+			if e.IsDir() {
+				candidate := filepath.Join(root, e.Name())
+				if _, serr := os.Stat(filepath.Join(candidate, "oci-layout")); serr == nil {
+					layoutDir = candidate
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return nil, errors.Errorf("ref does not contain a valid OCI layout: oci-layout file not found at root or in any immediate subdirectory")
+		}
+	}
+
+	layoutData, err := os.ReadFile(filepath.Join(layoutDir, "oci-layout"))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read oci-layout file")
+	}
+	var layout ocispecs.ImageLayout
+	if err := json.Unmarshal(layoutData, &layout); err != nil {
+		return nil, errors.Wrap(err, "failed to parse oci-layout file")
+	}
+	if layout.Version != ocispecs.ImageLayoutVersion {
+		return nil, errors.Errorf("unsupported OCI layout version: %s", layout.Version)
+	}
+
+	indexData, err := os.ReadFile(filepath.Join(layoutDir, "index.json"))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read index.json")
+	}
+	var index ocispecs.Index
+	if err := json.Unmarshal(indexData, &index); err != nil {
+		return nil, errors.Wrap(err, "failed to parse index.json")
+	}
+	if len(index.Manifests) == 0 {
+		return nil, errors.Errorf("OCI layout index.json has no manifests")
+	}
+
+	layoutStore, err := local.NewStore(layoutDir)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create content store for OCI layout")
+	}
+
+	done := progress.OneOff(ctx, "ingesting OCI layout")
+
+	for _, mfstDesc := range index.Manifests {
+		if err := contentutil.CopyChain(ctx, ic.opt.ContentStore, layoutStore, mfstDesc); err != nil {
+			return nil, done(errors.Wrapf(err, "failed to copy manifest %s from OCI layout", mfstDesc.Digest))
+		}
+	}
+
+	// If the index contains a single manifest, return the manifest descriptor
+	// directly so it is pushed as a flat manifest (matching the behavior of
+	// tools like oras and the original AIKit push path). Multi-manifest
+	// indices are preserved as-is.
+	if len(index.Manifests) == 1 {
+		done(nil)
+		return &index.Manifests[0], nil
+	}
+
+	labels := map[string]string{}
+	for i, mfstDesc := range index.Manifests {
+		labels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i)] = mfstDesc.Digest.String()
+	}
+
+	indexDigest := digest.FromBytes(indexData)
+	indexDesc := ocispecs.Descriptor{
+		MediaType: index.MediaType,
+		Digest:    indexDigest,
+		Size:      int64(len(indexData)),
+	}
+
+	if err := content.WriteBlob(ctx, ic.opt.ContentStore, indexDigest.String(), bytes.NewReader(indexData), indexDesc, content.WithLabels(labels)); err != nil {
+		return nil, done(errors.Wrap(err, "failed to write OCI layout index to content store"))
+	}
+
+	done(nil)
+	return &indexDesc, nil
 }
 
 func (ic *ImageWriter) exportLayers(ctx context.Context, refCfg cacheconfig.RefConfig, s session.Group, refs ...cache.ImmutableRef) ([]solver.Remote, error) {
