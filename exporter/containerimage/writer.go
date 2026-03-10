@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/continuity/fs"
 	"github.com/containerd/platforms"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/cache"
@@ -368,30 +370,19 @@ func (ic *ImageWriter) CommitOCILayout(ctx context.Context, ref cache.ImmutableR
 	}
 	defer lm.Unmount()
 
-	// Auto-detect OCI layout directory: check root first, then immediate subdirectories
-	layoutDir := root
-	if _, err := os.Stat(filepath.Join(root, "oci-layout")); os.IsNotExist(err) {
-		entries, dirErr := os.ReadDir(root)
-		if dirErr != nil {
-			return nil, errors.Wrap(dirErr, "failed to read mount root")
-		}
-		found := false
-		for _, e := range entries {
-			if e.IsDir() {
-				candidate := filepath.Join(root, e.Name())
-				if _, serr := os.Stat(filepath.Join(candidate, "oci-layout")); serr == nil {
-					layoutDir = candidate
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return nil, errors.Errorf("ref does not contain a valid OCI layout: oci-layout file not found at root or in any immediate subdirectory")
-		}
+	// Auto-detect OCI layout directory: check root first, then immediate
+	// subdirectories. All path resolution uses fs.RootPath to prevent
+	// symlink escape from the mount root.
+	layoutDir, err := resolveOCILayoutDir(root)
+	if err != nil {
+		return nil, err
 	}
 
-	layoutData, err := os.ReadFile(filepath.Join(layoutDir, "oci-layout"))
+	layoutPath, err := fs.RootPath(layoutDir, "oci-layout")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to resolve oci-layout path")
+	}
+	layoutData, err := os.ReadFile(layoutPath)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read oci-layout file")
 	}
@@ -403,7 +394,11 @@ func (ic *ImageWriter) CommitOCILayout(ctx context.Context, ref cache.ImmutableR
 		return nil, errors.Errorf("unsupported OCI layout version: %s", layout.Version)
 	}
 
-	indexData, err := os.ReadFile(filepath.Join(layoutDir, "index.json"))
+	indexPath, err := fs.RootPath(layoutDir, "index.json")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to resolve index.json path")
+	}
+	indexData, err := os.ReadFile(indexPath)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read index.json")
 	}
@@ -428,6 +423,15 @@ func (ic *ImageWriter) CommitOCILayout(ctx context.Context, ref cache.ImmutableR
 		}
 	}
 
+	// After CopyChain, set GC reference labels on each manifest so containerd
+	// GC does not collect child blobs (config + layers) after the lease is
+	// released. This mirrors what commitDistributionManifest does.
+	for _, mfstDesc := range index.Manifests {
+		if err := ic.setManifestGCLabels(ctx, mfstDesc); err != nil {
+			return nil, done(errors.Wrapf(err, "failed to set GC labels for manifest %s", mfstDesc.Digest))
+		}
+	}
+
 	// If the index contains a single manifest, return the manifest descriptor
 	// directly so it is pushed as a flat manifest (matching the behavior of
 	// tools like oras and the original AIKit push path). Multi-manifest
@@ -437,24 +441,123 @@ func (ic *ImageWriter) CommitOCILayout(ctx context.Context, ref cache.ImmutableR
 		return &index.Manifests[0], nil
 	}
 
-	labels := map[string]string{}
+	idxLabels := map[string]string{}
 	for i, mfstDesc := range index.Manifests {
-		labels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i)] = mfstDesc.Digest.String()
+		idxLabels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i)] = mfstDesc.Digest.String()
 	}
 
 	indexDigest := digest.FromBytes(indexData)
+
+	// Default to OCI image index media type if not set in the index.
+	indexMediaType := index.MediaType
+	if indexMediaType == "" {
+		indexMediaType = ocispecs.MediaTypeImageIndex
+	}
+
 	indexDesc := ocispecs.Descriptor{
-		MediaType: index.MediaType,
+		MediaType: indexMediaType,
 		Digest:    indexDigest,
 		Size:      int64(len(indexData)),
 	}
 
-	if err := content.WriteBlob(ctx, ic.opt.ContentStore, indexDigest.String(), bytes.NewReader(indexData), indexDesc, content.WithLabels(labels)); err != nil {
+	if err := content.WriteBlob(ctx, ic.opt.ContentStore, indexDigest.String(), bytes.NewReader(indexData), indexDesc, content.WithLabels(idxLabels)); err != nil {
 		return nil, done(errors.Wrap(err, "failed to write OCI layout index to content store"))
 	}
 
 	done(nil)
 	return &indexDesc, nil
+}
+
+// resolveOCILayoutDir finds the OCI layout directory within the mounted root.
+// It checks the root first, then immediate subdirectories. All path resolution
+// uses fs.RootPath to prevent symlink escape.
+func resolveOCILayoutDir(root string) (string, error) {
+	p, err := fs.RootPath(root, "oci-layout")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to resolve oci-layout path")
+	}
+	if _, err := os.Stat(p); err == nil {
+		return root, nil
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to read mount root")
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		// Validate the subdirectory name: only allow simple directory names
+		// that cannot be path traversal components.
+		if !isSimpleName(e.Name()) {
+			continue
+		}
+		candidatePath, err := fs.RootPath(root, filepath.Join(e.Name(), "oci-layout"))
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(candidatePath); err == nil {
+			// Resolve the subdirectory itself through fs.RootPath
+			dir, err := fs.RootPath(root, e.Name())
+			if err != nil {
+				continue
+			}
+			return dir, nil
+		}
+	}
+	return "", errors.Errorf("ref does not contain a valid OCI layout: oci-layout file not found at root or in any immediate subdirectory")
+}
+
+// isSimpleName returns true if name is a plain file/directory name with no
+// path separators, no "." or ".." components, and no null bytes.
+func isSimpleName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, "/\\\x00") && simpleNameRe.MatchString(name)
+}
+
+// simpleNameRe matches safe directory names (alphanumeric, dash, underscore, dot).
+var simpleNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// setManifestGCLabels reads a manifest from the content store, parses its
+// children (config + layers), and sets containerd GC reference labels so that
+// child blobs are not garbage-collected after the lease is released.
+func (ic *ImageWriter) setManifestGCLabels(ctx context.Context, desc ocispecs.Descriptor) error {
+	dt, err := content.ReadBlob(ctx, ic.opt.ContentStore, desc)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read manifest %s", desc.Digest)
+	}
+
+	var mfst ocispecs.Manifest
+	if err := json.Unmarshal(dt, &mfst); err != nil {
+		return errors.Wrapf(err, "failed to parse manifest %s", desc.Digest)
+	}
+
+	gcLabels := map[string]string{
+		"containerd.io/gc.ref.content.0": mfst.Config.Digest.String(),
+	}
+	for i, layer := range mfst.Layers {
+		gcLabels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i+1)] = layer.Digest.String()
+	}
+
+	info, err := ic.opt.ContentStore.Info(ctx, desc.Digest)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get info for manifest %s", desc.Digest)
+	}
+
+	// Merge new GC labels with any existing labels
+	if info.Labels == nil {
+		info.Labels = gcLabels
+	} else {
+		for k, v := range gcLabels {
+			info.Labels[k] = v
+		}
+	}
+
+	_, err = ic.opt.ContentStore.Update(ctx, info, "labels")
+	return err
 }
 
 func (ic *ImageWriter) exportLayers(ctx context.Context, refCfg cacheconfig.RefConfig, s session.Group, refs ...cache.ImmutableRef) ([]solver.Remote, error) {
